@@ -10,9 +10,14 @@ import numpy as np
 
 from normalize import normalize_row
 from blocking import generate_candidates
-from features import build_features, FEATURE_COLS
+from features import build_features, fit_tfidf_vectorizer, FEATURE_COLS
 from model import train_classifier, predict_proba, tune_threshold
 from metrics import macro_f_beta
+
+HARD_NEGATIVE_NAME_SIM = 0.75   # label==0 but name looks this similar -> hard negative
+HARD_NEGATIVE_WEIGHT = 3.0      # sample_weight multiplier for hard negatives
+FALSE_POSITIVE_PROBA = 0.5      # val pairs the model scored >= this but were wrong
+FALSE_POSITIVE_WEIGHT = 5.0     # these get the strongest up-weighting in the refit
 
 
 def load_source(path):
@@ -47,7 +52,21 @@ def norm_list(df):
     return [normalize_row(r["business_name"], r["business_address"]) for _, r in df.iterrows()]
 
 
-def build_feature_table(s1_df, s2_df, s3_df, cand_all):
+def fit_corpus_vectorizers(s1_df, s2_df, s3_df):
+    """Fit TF-IDF vectorizers ONCE on train text, reused for val/test/final
+    predict so val/test text never leaks into vectorizer fitting and we
+    don't refit per call (see features.fit_tfidf_vectorizer)."""
+    all_dfs = [d for d in (s1_df, s2_df, s3_df) if not d.empty]
+    name_corpus, addr_corpus = [], []
+    for d in all_dfs:
+        for _, r in d.iterrows():
+            n = normalize_row(r["business_name"], r["business_address"])
+            name_corpus.append(n["name"]["expanded"])
+            addr_corpus.append(n["address"]["expanded"])
+    return fit_tfidf_vectorizer(name_corpus), fit_tfidf_vectorizer(addr_corpus)
+
+
+def build_feature_table(s1_df, s2_df, s3_df, cand_all, name_vec=None, addr_vec=None):
     s1_norm = norm_list(s1_df)
     s2_norm = norm_list(s2_df)
     s3_norm = norm_list(s3_df)
@@ -62,7 +81,8 @@ def build_feature_table(s1_df, s2_df, s3_df, cand_all):
         sub = cand_all[cand_all["source"] == source]
         if sub.empty:
             continue
-        feat = build_features(sub, s1_norm, other_norm, s1_country, other_country)
+        feat = build_features(sub, s1_norm, other_norm, s1_country, other_country,
+                               name_vec=name_vec, addr_vec=addr_vec)
         if feat.empty:
             continue
         feat["source"] = source
@@ -79,6 +99,23 @@ def label_pairs(feat_df, gt_dict):
         return int(row["other_id"] in gt_dict.get(row["s1_id"], set()))
     feat_df["label"] = feat_df.apply(is_match, axis=1)
     return feat_df
+
+
+def compute_sample_weights(feat_df, extra_hard_ids=None):
+    """Up-weight hard negatives so the model specifically learns the
+    "similar name, wrong match" case F0.5 punishes hardest:
+      - structural hard negatives: label==0 but name_token_sort is high
+      - mined hard negatives: (s1_id, other_id) pairs the previous round's
+        model scored as false positives on the validation split
+    """
+    extra_hard_ids = extra_hard_ids or set()
+    w = pd.Series(1.0, index=feat_df.index)
+    structural = (feat_df["label"] == 0) & (feat_df["name_token_sort"] >= HARD_NEGATIVE_NAME_SIM)
+    w[structural] = HARD_NEGATIVE_WEIGHT
+    if extra_hard_ids:
+        mined = feat_df.apply(lambda r: (r["s1_id"], r["other_id"]) in extra_hard_ids, axis=1)
+        w[mined] = FALSE_POSITIVE_WEIGHT
+    return w.values
 
 
 def entity_level_split(s1_ids, val_frac=0.2, seed=42):
@@ -118,16 +155,23 @@ def run(data_dir, out_dir):
     s1_train = train_s1[train_s1["entity_id"].isin(train_ids)].reset_index(drop=True)
     s1_val = train_s1[train_s1["entity_id"].isin(val_ids)].reset_index(drop=True)
 
+    # fit TF-IDF vocabulary once on the full train corpus, reuse everywhere
+    # below (train split, val split, full refit, test) instead of refitting
+    # per call — cheaper and avoids fitting on val/test text.
+    name_vec, addr_vec = fit_corpus_vectorizers(train_s1, train_s2, train_s3)
+
     # --- candidates + features on train split ---
     cand_train = candidates_with_source(s1_train, train_s2, train_s3)
-    feat_train = build_feature_table(s1_train, train_s2, train_s3, cand_train)
+    feat_train = build_feature_table(s1_train, train_s2, train_s3, cand_train, name_vec, addr_vec)
     feat_train = label_pairs(feat_train, gt)
+    weights_train = compute_sample_weights(feat_train)
 
-    model = train_classifier(feat_train, feat_train["label"])
+    model = train_classifier(feat_train, feat_train["label"], sample_weight=weights_train)
 
     # --- candidates + features on val split (recall ceiling check happens here) ---
     cand_val = candidates_with_source(s1_val, train_s2, train_s3)
-    feat_val = build_feature_table(s1_val, train_s2, train_s3, cand_val)
+    feat_val = build_feature_table(s1_val, train_s2, train_s3, cand_val, name_vec, addr_vec)
+    feat_val = label_pairs(feat_val, gt)
     val_proba = predict_proba(model, feat_val)
 
     val_true = {s1: gt.get(s1, set()) for s1 in s1_val["entity_id"]}
@@ -145,18 +189,26 @@ def run(data_dir, out_dir):
         print(f"[val] candidate recall ceiling = {recall_ceiling:.4f}  "
               f"({len(cand_pairs)} candidates for {len(s1_val)} S1 entities)")
 
+    # --- hard-negative mining round: pairs the model scored confidently as
+    # a match but were actually wrong get force-upweighted in the refit ---
+    fp_mask = (val_proba >= FALSE_POSITIVE_PROBA) & (feat_val["label"].values == 0)
+    mined_hard_ids = set(zip(feat_val.loc[fp_mask, "s1_id"], feat_val.loc[fp_mask, "other_id"]))
+    if mined_hard_ids:
+        print(f"[val] mined {len(mined_hard_ids)} false-positive hard negatives for refit")
+
     # --- refit on full training data, predict on test ---
     full_cand = candidates_with_source(train_s1, train_s2, train_s3)
-    full_feat = build_feature_table(train_s1, train_s2, train_s3, full_cand)
+    full_feat = build_feature_table(train_s1, train_s2, train_s3, full_cand, name_vec, addr_vec)
     full_feat = label_pairs(full_feat, gt)
-    final_model = train_classifier(full_feat, full_feat["label"])
+    weights_full = compute_sample_weights(full_feat, extra_hard_ids=mined_hard_ids)
+    final_model = train_classifier(full_feat, full_feat["label"], sample_weight=weights_full)
 
     test_s1 = load_source(f"{data_dir}/test/test_source1.tsv")
     test_s2 = load_source(f"{data_dir}/test/test_source2.tsv")
     test_s3 = load_source(f"{data_dir}/test/test_source3.tsv")
 
     test_cand = candidates_with_source(test_s1, test_s2, test_s3)
-    test_feat = build_feature_table(test_s1, test_s2, test_s3, test_cand)
+    test_feat = build_feature_table(test_s1, test_s2, test_s3, test_cand, name_vec, addr_vec)
     if test_feat.empty:
         pred_df = pd.DataFrame(columns=["s1_id", "other_id"])
     else:

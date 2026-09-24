@@ -10,7 +10,7 @@ from metrics import macro_f_beta
 THRESHOLD_GRID = np.round(np.arange(0.30, 0.99, 0.02), 2)
 
 
-def train_classifier(X: pd.DataFrame, y: pd.Series) -> XGBClassifier:
+def train_classifier(X: pd.DataFrame, y: pd.Series, sample_weight=None) -> XGBClassifier:
     # XGBoost is Apache-2.0 licensed; a few hundred trees stays well under
     # any parameter-count constraint aimed at neural / LLM-scale models.
     model = XGBClassifier(
@@ -19,7 +19,7 @@ def train_classifier(X: pd.DataFrame, y: pd.Series) -> XGBClassifier:
         eval_metric="logloss", n_jobs=-1,
         scale_pos_weight=_pos_weight(y),
     )
-    model.fit(X[FEATURE_COLS], y)
+    model.fit(X[FEATURE_COLS], y, sample_weight=sample_weight)
     return model
 
 
